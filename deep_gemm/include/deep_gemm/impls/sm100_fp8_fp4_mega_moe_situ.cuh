@@ -395,12 +395,16 @@ sm100_fp8_fp4_mega_moe_situ_impl(void* y,
         });
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
-        // Get SM offset (~6.5 us)
+        // Get SM offset
+        // NOTES: only the experts this SM routes to take a (contended) global atomic; the arrival count in the
+        // high 32 bits is pushed by SM 0 after the grid sync below, where every SM has added its counts
         #pragma unroll
         for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
-            const uint64_t send_value = (1ull << 32) | static_cast<uint64_t>(shared_storage.expert_token_count[i]);
-            shared_storage.expert_token_count[i] = static_cast<uint32_t>(
-                ptx::atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
+            const uint32_t num_local_tokens = shared_storage.expert_token_count[i];
+            if (num_local_tokens != 0) {
+                shared_storage.expert_token_count[i] = static_cast<uint32_t>(
+                    ptx::atomic_add(workspace.get_expert_send_count_ptr(i), static_cast<uint64_t>(num_local_tokens)));
+            }
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
@@ -431,11 +435,13 @@ sm100_fp8_fp4_mega_moe_situ_impl(void* y,
             for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
                 const auto dst_rank_idx = i / kNumExpertsPerRank;
                 const auto dst_local_expert_idx = i % kNumExpertsPerRank;
-                const auto expert_status = *workspace.get_expert_send_count_ptr(i);
+                const auto expert_status = (static_cast<uint64_t>(kNumSMs) << 32) |
+                    (*workspace.get_expert_send_count_ptr(i) & 0xffffffffull);
                 *sym_buffer.map(
                     workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
                     dst_rank_idx) = expert_status & 0xffffffff;
-                ptx::atomic_add_sys(
+                // NOTES: a reduction, not a returning atomic: a returning one waits an NVLink round trip per iteration
+                ptx::red_add_sys(
                     sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
                     expert_status);
             }
